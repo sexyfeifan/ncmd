@@ -1,4 +1,4 @@
-# 网易云音乐下载器 NeteaseMusicDownloader v2.4.0
+# NetEase Cloud Music Tool 音乐下载器 v2.4.0
 
 ## 简介
 
