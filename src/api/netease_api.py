@@ -1,0 +1,247 @@
+"""
+网易云音乐 API 封装模块
+"""
+import json
+import urllib.parse
+import requests
+import logging
+from random import randrange
+from hashlib import md5
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import logging
+
+# 音质映射：API 参数 -> 中文显示名称
+QUALITY_MAP = {
+    'standard': '标准',
+    'exhigh': '极高',
+    'lossless': '无损',
+    'jyeffect': '高清臻音',
+    'jymaster': '超清母带',
+    'sky': '沉浸环绕声',
+}
+
+# 反向映射：中文名称 -> API 参数
+QUALITY_MAP_REVERSE = {v: k for k, v in QUALITY_MAP.items()}
+
+# 音质降级顺序（从高到低）
+QUALITY_FALLBACK_ORDER = [
+    'sky',       # 沉浸环绕声
+    'jymaster',  # 超清母带
+    'jyeffect',  # 高清臻音
+    'lossless',  # 无损
+    'exhigh',    # 极高
+    'standard'   # 标准
+]
+
+
+def post(url: str, params: str, cookies: dict) -> str:
+    """
+    发送 POST 请求到网易云 API
+    
+    Args:
+        url: API 地址
+        params: 加密后的参数
+        cookies: Cookie 字典
+        
+    Returns:
+        响应文本
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.164 NeteaseMusicDesktop/2.10.2.200154',
+        'Referer': '',
+    }
+    cookies = {'os': 'pc', 'appver': '', 'osver': '', 'deviceId': 'pyncm!', **cookies}
+    try:
+        response = requests.post(url, headers=headers, cookies=cookies, data={"params": params}, timeout=10)
+        response.raise_for_status()
+        return response.text
+    except requests.RequestException as e:
+        logging.error(f"POST 请求失败：{url}，错误：{str(e)}")
+        raise
+
+
+def hash_hex_digest(text: str) -> str:
+    """计算文本的 MD5 哈希值"""
+    return ''.join(hex(d)[2:].zfill(2) for d in md5(text.encode('utf-8')).digest())
+
+
+def url_v1(song_id: str, level: str, cookies: dict) -> dict:
+    """
+    获取歌曲下载链接
+    
+    Args:
+        song_id: 歌曲 ID
+        level: 音质级别
+        cookies: Cookie 字典
+        
+    Returns:
+        包含下载链接的字典
+    """
+    url = "https://interface3.music.163.com/eapi/song/enhance/player/url/v1"
+    AES_KEY = b"e82ckenh8dichen8"
+    config = {"os": "pc", "appver": "", "osver": "", "deviceId": "pyncm!", "requestId": str(randrange(20000000, 30000000))}
+    payload = {'ids': [int(song_id)], 'level': level, 'encodeType': 'flac', 'header': json.dumps(config)}
+    if level == 'sky':
+        payload['immerseType'] = 'c51'
+    url2 = urllib.parse.urlparse(url).path.replace("/eapi/", "/api/")
+    digest = hash_hex_digest(f"nobody{url2}use{json.dumps(payload)}md5forencrypt")
+    params = f"{url2}-36cd479b6b5-{json.dumps(payload)}-36cd479b6b5-{digest}"
+    padder = padding.PKCS7(algorithms.AES(AES_KEY).block_size).padder()
+    padded_data = padder.update(params.encode()) + padder.finalize()
+    cipher = Cipher(algorithms.AES(AES_KEY), modes.ECB())
+    encryptor = cipher.encryptor()
+    enc = encryptor.update(padded_data) + encryptor.finalize()
+    params = ''.join(hex(d)[2:].zfill(2) for d in enc)
+    return json.loads(post(url, params, cookies))
+
+def url_v1_with_fallback(song_id: str, level: str, cookies: dict) -> dict:
+    """
+    获取歌曲下载链接（带音质降级功能）
+    
+    如果指定音质不可用，则自动降级到可用的较低音质
+    
+    Args:
+        song_id: 歌曲 ID
+        level: 音质级别
+        cookies: Cookie 字典
+        
+    Returns:
+        包含下载链接的字典
+    """
+    # 获取音质降级顺序
+    try:
+        level_index = QUALITY_FALLBACK_ORDER.index(level)
+        fallback_levels = QUALITY_FALLBACK_ORDER[level_index:]
+    except ValueError:
+        # 如果指定音质不在列表中，使用所有音质
+        fallback_levels = QUALITY_FALLBACK_ORDER
+    
+    # 尝试每个音质级别
+    for fallback_level in fallback_levels:
+        try:
+            result = url_v1(song_id, fallback_level, cookies)
+            # 检查是否有有效的下载链接
+            if result.get('data') and result['data'][0].get('url'):
+                # 记录实际使用的音质
+                result['data'][0]['requested_level'] = level
+                result['data'][0]['actual_level'] = fallback_level
+                logging.info(f"歌曲 {song_id} 使用音质: {fallback_level} (请求: {level})")
+                return result
+        except Exception as e:
+            logging.warning(f"音质 {fallback_level} 获取失败: {str(e)}")
+            continue
+    
+    # 所有音质都失败，返回原始结果
+    logging.error(f"歌曲 {song_id} 所有音质均不可用")
+    return url_v1(song_id, level, cookies)
+
+
+def name_v1(song_id: str) -> dict:
+    """
+    获取歌曲详细信息
+    
+    Args:
+        song_id: 歌曲 ID
+        
+    Returns:
+        歌曲信息字典
+    """
+    url = "https://interface3.music.163.com/api/v3/song/detail"
+    data = {'c': json.dumps([{"id": int(song_id), "v": 0}])}
+    try:
+        response = requests.post(url, data=data, timeout=5)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        logging.error(f"获取歌曲信息失败：{song_id}，错误：{str(e)}")
+        raise
+
+
+def lyric_v1(song_id: str, cookies: dict) -> dict:
+    """
+    获取歌曲歌词
+    
+    Args:
+        song_id: 歌曲 ID
+        cookies: Cookie 字典
+        
+    Returns:
+        歌词数据字典
+    """
+    url = "https://interface3.music.163.com/api/song/lyric"
+    data = {'id': song_id, 'cp': 'false', 'tv': '0', 'lv': '0', 'rv': '0', 'kv': '0', 'yv': '0', 'ytv': '0', 'yrv': '0'}
+    try:
+        response = requests.post(url, data=data, cookies=cookies, timeout=5)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        logging.error(f"获取歌词失败：{song_id}，错误：{str(e)}")
+        raise
+
+
+def playlist_detail(playlist_id: str, cookies: dict) -> dict:
+    """
+    获取歌单详情
+    
+    Args:
+        playlist_id: 歌单 ID
+        cookies: Cookie 字典
+        
+    Returns:
+        歌单信息字典，包含歌曲列表
+    """
+    url = 'https://music.163.com/api/v6/playlist/detail'
+    data = {'id': playlist_id}
+    headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://music.163.com/'}
+    try:
+        logging.info(f"正在请求歌单详情 API: {url}, playlist_id={playlist_id}")
+        response = requests.post(url, data=data, headers=headers, cookies=cookies, timeout=15)
+        response.raise_for_status()
+        logging.info(f"歌单详情 API 响应状态码: {response.status_code}")
+        result = response.json()
+        if result.get('code') != 200:
+            logging.error(f"歌单 API 返回错误码: {result.get('code')}")
+            return {'status': result.get('code'), 'msg': '歌单解析失败'}
+        playlist = result.get('playlist', {})
+        logging.info(f"成功获取歌单: {playlist.get('name')}")
+        info = {
+            'status': 200,
+            'playlist': {
+                'id': playlist.get('id'),
+                'name': playlist.get('name'),
+                'tracks': []
+            }
+        }
+        track_ids = [str(t['id']) for t in playlist.get('trackIds', [])]
+        total_tracks = len(track_ids)
+        logging.info(f"歌单共有 {total_tracks} 首歌曲，开始批量获取歌曲详情")
+        
+        for i in range(0, len(track_ids), 100):
+            batch_num = i // 100 + 1
+            total_batches = (len(track_ids) + 99) // 100
+            batch_ids = track_ids[i:i+100]
+            logging.info(f"正在获取第 {batch_num}/{total_batches} 批歌曲详情 ({len(batch_ids)} 首)")
+            
+            song_data = {'c': json.dumps([{'id': int(sid), 'v': 0} for sid in batch_ids])}
+            song_resp = requests.post('https://interface3.music.163.com/api/v3/song/detail', 
+                                    data=song_data, headers=headers, cookies=cookies, timeout=15)
+            song_resp.raise_for_status()
+            song_result = song_resp.json()
+            songs_in_batch = song_result.get('songs', [])
+            logging.info(f"第 {batch_num} 批获取成功，包含 {len(songs_in_batch)} 首歌曲")
+            
+            for song in songs_in_batch:
+                info['playlist']['tracks'].append({
+                    'id': song['id'],
+                    'name': song['name'],
+                    'artists': '/'.join(artist['name'] for artist in song['ar']),
+                    'album': song['al']['name'],
+                    'picUrl': song['al'].get('picUrl', '')
+                })
+        
+        logging.info(f"歌单解析完成，共获取 {len(info['playlist']['tracks'])} 首歌曲")
+        return info
+    except requests.RequestException as e:
+        logging.error(f"歌单解析失败：{playlist_id}，错误：{str(e)}")
+        return {'status': 500, 'msg': str(e)}
