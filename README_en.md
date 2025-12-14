@@ -1,4 +1,4 @@
-# NetEase Cloud Music Tool 音乐下载器 v2.4.0
+# NetEase Cloud Music Download 音乐下载器 v2.4.0
 
 ## 简介
 
